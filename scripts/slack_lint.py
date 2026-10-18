@@ -47,6 +47,15 @@ def _protect(text: str) -> tuple[str, list[str]]:
 
     text = FENCE_RE.sub(stash_fence, text)
 
+    # An opening ``` with no closing one: protect it through end of text so
+    # its contents are not linted, and strip the language hint like rule 4.
+    open_m = re.search(r"^[ \t]*```", text, flags=re.MULTILINE)
+    if open_m:
+        open_at = open_m.start()
+        tail = re.sub(r"^([ \t]*```)[A-Za-z0-9_+\-#]+[ \t\r]*\n", r"\1\n", text[open_at:])
+        stash.append(tail)
+        text = text[:open_at] + f"\x00FENCE{len(stash) - 1}\x00"
+
     def stash_inline(m: re.Match) -> str:
         stash.append(m.group(0))
         return f"\x00ICODE{len(stash) - 1}\x00"
@@ -73,20 +82,30 @@ def _double_asterisk_to_single(text: str) -> str:
 
 
 def _md_headings_to_bold(text: str) -> str:
-    # Rule 2: heading lines become *bold* on their own line.
+    # Rule 2: heading lines become *bold* on their own line. Any *x* already
+    # inside the heading (e.g. from rule 1) is unwrapped first, since Slack
+    # can't nest bold and the leftover asterisks would break idempotence.
+    def to_bold(m: re.Match) -> str:
+        inner = re.sub(r"\*([^*\n]+)\*", r"\1", m.group(1).strip())
+        inner = inner.strip("* \t")
+        return f"*{inner}*" if inner else m.group(0)
+
     return re.sub(
         r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$",
-        lambda m: f"*{m.group(1).strip()}*",
+        to_bold,
         text,
         flags=re.MULTILINE,
     )
 
 
 def _md_links_to_slack(text: str) -> str:
-    # Rule 3: [label](url) -> <url|label>. Skip empty url. Tolerate parens
-    # in url since Slack <url|label> doesn't care about them.
+    # Rule 3: [label](url) -> <url|label>. Skip empty url. Tolerate one level
+    # of balanced parens in url since Slack <url|label> doesn't care about them;
+    # a url with an unbalanced "(" falls back to ending at the first ")".
     return re.sub(
-        r"\[([^\]\n]+)\]\(([^)\s][^)\n]*)\)",
+        r"\[([^\]\n]+)\]\("
+        r"((?![)\s])(?:[^()\n]|\([^()\n]*\))+|[^)\s][^)\n]*)"
+        r"\)",
         lambda m: f"<{m.group(2)}|{m.group(1)}>",
         text,
     )
@@ -162,8 +181,8 @@ def _escape_bare_html(text: str) -> str:
     # <!date^…>. Anything else gets escaped.
     slack_token_re = re.compile(
         r"<(?:"
-        r"@[A-Z0-9]+"                              # user mention
-        r"|#[A-Z0-9]+(?:\|[^>]*)?"                  # channel mention
+        r"@[A-Z0-9]+(?:\|[^<>]*)?"                 # user mention (optional label)
+        r"|#[A-Z0-9]+(?:\|[^<>]*)?"                 # channel mention
         r"|![a-zA-Z][^>]*"                          # !here / !channel / !date^…
         r"|mailto:[^>|]+(?:\|[^>]+)?"               # mailto link
         r"|https?://[^>|\s]+(?:\|[^>]+)?"           # http(s) link
